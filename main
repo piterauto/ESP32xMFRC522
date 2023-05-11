@@ -1,0 +1,488 @@
+#include <EEPROM.h>
+#include <SPI.h>
+#include <MFRC522.h>
+#include <LiquidCrystal.h>
+
+#define LED_ON HIGH                 //Led definitions
+#define LED_OFF LOW
+#define sizeEEPROM 512
+#define redLed 27                   //GPIO pins definitions
+#define greenLed 12
+#define yellowLed 14
+#define buzzer 13
+#define wipeB 36
+#define RFID_SS_PIN 5
+#define RFID_RST_PIN 16
+#define LCD_BRIGHTNESS_PIN 4
+#define LCD_BRIGHTNESS 80
+#define LCD_RS_PIN 22
+#define LCD_EN_PIN 16
+#define LCD_D4_PIN 32
+#define LCD_D5_PIN 33
+#define LCD_D6_PIN 25
+#define LCD_D7_PIN 26
+
+boolean isMatch = false;
+boolean programMode = false;
+int successRead;                    // Variable integer to check if we have Successful Read
+byte storedCard[4];                 // Stores an ID read from EEPROM
+byte readCard[4];                   // Stores scanned ID read from RFID Module
+byte masterCard[4];                 // Stores master card's ID read from EEPROM
+
+MFRC522 rfid(RFID_SS_PIN, RFID_RST_PIN);                                                        // Create MFRC522 instance
+LiquidCrystal lcd(LCD_RS_PIN, LCD_EN_PIN, LCD_D4_PIN, LCD_D5_PIN, LCD_D6_PIN, LCD_D7_PIN);      //Create 16x2 LCD instance
+
+void setup() {
+    pinMode(redLed, OUTPUT);                    //Arduino Pin Configuration
+    pinMode(greenLed, OUTPUT);
+    pinMode(yellowLed, OUTPUT);
+    pinMode(wipeB, INPUT_PULLUP);               // Enable pin's pull up resistor to avoid bouncing
+    pinMode(buzzer, OUTPUT);
+    pinMode(LCD_BRIGHTNESS_PIN, OUTPUT);
+
+    digitalWrite(buzzer, LOW);
+    digitalWrite(redLed, LED_OFF);
+    digitalWrite(greenLed, LED_OFF);
+    digitalWrite(yellowLed, LED_OFF);
+
+    //Protocol Configuration
+    Serial.begin(115200);  // Initialize serial communications with PC
+    SPI.begin();           // MFRC522 Hardware uses SPI protocol
+
+    //Needed initializations and config
+    rfid.PCD_Init();    // Initialize MFRC522 Hardware
+    lcd.begin(16, 2);   //Initialize 16 columns by 2 rows LCD
+    EEPROM.begin(sizeEEPROM);  //Initialize EEPROM
+    rfid.PCD_SetAntennaGain(rfid.RxGain_max);   //Increase antenna's gain
+
+    //Wipe Code if WipeButton is HIGH
+    if (digitalRead(wipeB) == HIGH) {
+        digitalWrite(redLed, LED_ON);
+        Serial.println(F("Wipe Button Pressed"));
+        Serial.println(F("You have 15 seconds to Cancel"));
+        Serial.println(F("This will be remove all records and cannot be undone"));
+
+        lcd.print("EEPROM wipe mode");
+        lcd.setCursor(0, 1);
+        lcd.print("Time left: ");
+        for (int i = 15; i > 0; i--) {
+            lcd.setCursor(10, 1);
+            lcd.print(i);
+            lcd.print("s");
+            delay(1000);
+            lcd.setCursor(10, 1);
+            lcd.print("    ");
+        }
+
+        if (digitalRead(wipeB) == HIGH) {    // If button still be pressed, wipe EEPROM
+            Serial.println(F("Starting Wiping EEPROM"));
+            for (int x = 0; x < EEPROM.length(); x = x + 1) {    //Loop end of EEPROM address
+                if (EEPROM.read(x) != 0) {              //If EEPROM address not 0
+                    EEPROM.write(x, 0);
+                    EEPROM.commit();
+                }
+            }
+            Serial.println(F("EEPROM Successfully Wiped"));
+            lcd.clear();
+            lcd.print("EEPROM empty");
+            for (int i = 0; i < 3; i++, digitalWrite(redLed, LED_OFF)) {
+                digitalWrite(redLed, LED_ON);
+                delay(200);
+                digitalWrite(redLed, LED_OFF);
+                delay(200);
+            }
+        }
+        else {
+            Serial.println(F("Wiping Cancelled"));
+            digitalWrite(redLed, LED_OFF);
+        }
+    }
+    if (EEPROM.read(1) != 143) {    //Check if MASTER exists
+        lcd.clear();
+        lcd.print("NO MASTER");
+        Serial.println(F("No Master Card Defined"));
+        Serial.println(F("Scan A PICC to Define as Master Card"));
+        do {
+            successRead = getID();            // sets successRead to 1 when we get read from reader otherwise 0
+            digitalWrite(yellowLed, LED_ON);    // Visualize Master Card need to be defined
+            delay(100);
+            digitalWrite(yellowLed, LED_OFF);
+            delay(100);
+
+        } while (!successRead);                  // Program will not go further while you not get a successful read
+        for (int j = 0; j < 4; j++) {        // Loop 4 times
+            EEPROM.write(2 + j, readCard[j]);  // Write scanned PICC's UID to EEPROM, start from address 3
+            EEPROM.commit();
+            Serial.print("Odczytane UID z pętli: ");
+            Serial.println(readCard[j]);
+            Serial.print("Odczytane UID z EEPROM: ");
+            Serial.println(EEPROM.read(2 + j));
+        }
+        EEPROM.write(1, 143);                  // Write to EEPROM we defined Master Card.
+        EEPROM.commit();
+        Serial.println(F("Master Card Defined"));
+        lcd.clear();
+        lcd.print("Master defined.");
+    }
+    Serial.println(F("-------------------"));
+    Serial.println(F("Master Card's UID"));
+    for (int i = 0; i < 4; i++) {          // Read Master Card's UID from EEPROM
+        masterCard[i] = EEPROM.read(2 + i);    // Write it to masterCard
+        Serial.print(masterCard[i], HEX);
+    }
+    Serial.println("");
+    Serial.println(F("-------------------"));
+    Serial.println(F("Everything Ready"));
+    Serial.println(F("Waiting PICCs to be scanned"));
+    lcd.clear();
+    lcd.print("ALL GOOD :)");
+    delay(1000);
+    cycleLeds();    // Everything ready lets give user some feedback by cycling leds
+}
+
+
+///////////////////////////////////////// Main Loop ///////////////////////////////////
+void loop() {
+    do {
+        successRead = getID();  // sets successRead to 1 when we get read from reader otherwise 0
+        if (digitalRead(wipeB) == HIGH) {
+            digitalWrite(redLed, LED_ON);  // Make sure led is off
+            digitalWrite(greenLed, LED_OFF);  // Make sure led is off
+            digitalWrite(yellowLed, LED_OFF); // Make sure led is off
+            Serial.println(F("Wipe Button Pressed"));
+
+            lcd.print("MASTER wipe mode");
+            lcd.setCursor(0, 1);
+            lcd.print("Time left: ");
+            for (int i = 10; i > 0; i--) {
+                lcd.setCursor(10, 1);
+                lcd.print(i);
+                lcd.print("s");
+                delay(1000);
+                lcd.setCursor(10, 1);
+                lcd.print("    ");
+            }
+
+            Serial.println(F("Master Card will be Erased! in 10 seconds"));
+            if (digitalRead(wipeB) == HIGH) {
+                EEPROM.write(1, 0);                  // Reset Magic Number.
+                EEPROM.commit();
+                Serial.println(F("Restart device to re-program Master Card"));
+                lcd.clear();
+                lcd.print("NO MASTER");
+                lcd.setCursor(0, 1);
+                lcd.print("Reset device");
+                while (1);
+            }
+        }
+        if (programMode) {
+            cycleLeds();              // Program Mode cycles through RGB waiting to read a new card
+            lcd.clear();
+            lcd.print("Program mode");
+            lcd.setCursor(0, 1);
+            lcd.print("Scan new UID");
+        }
+        else {
+            normalModeOn();     // Normal mode, yellow Power LED is on, all others are off
+            lcd.clear();
+            lcd.print("Ready");
+        }
+    } while (!successRead);   //the program will not go further while you not get a successful read
+
+    lcd.clear();
+
+    if (programMode) {
+        if (isMaster(readCard)) { //If master card scanned again exit program mode
+            Serial.println(F("Master Card Scanned"));
+            Serial.println(F("Exiting Program Mode"));
+            Serial.println(F("-----------------------------"));
+            programMode = false;
+            return;
+        }
+        else {
+            if (findID(readCard)) { // If scanned card is known delete it
+                Serial.println(F("I know this PICC, removing..."));
+                lcd.clear();
+                lcd.print("Card known,");
+                lcd.setCursor(0, 1);
+                lcd.print("deleting...");
+                deleteID(readCard);
+                Serial.println("-----------------------------");
+                Serial.println(F("Scan a PICC to ADD or REMOVE to EEPROM"));
+            }
+            else {                    // If scanned card is not known add it
+                Serial.println(F("I do not know this PICC, adding..."));
+                writeID(readCard);
+                lcd.clear();
+                lcd.print("Card uknown,");
+                lcd.setCursor(0, 1);
+                lcd.print("adding...");
+                Serial.println(F("-----------------------------"));
+                Serial.println(F("Scan a PICC to ADD or REMOVE to EEPROM"));
+            }
+        }
+    }
+    else {
+        if (isMaster(readCard)) {   // If scanned card's ID matches Master Card's ID enter program mode
+            lcd.clear();
+            lcd.print("Program mode");
+            lcd.setCursor(0, 1);
+            lcd.print("Saved UIDs: ");
+            lcd.print(EEPROM.read(0));
+            programMode = true;
+            Serial.println(F("Hello Master - Entered Program Mode"));
+            int count = EEPROM.read(0);   // Read the first Byte of EEPROM that
+            Serial.print(F("I have "));     // stores the number of ID's in EEPROM
+            Serial.print(count);
+            Serial.print(F(" record(s) on EEPROM"));
+            Serial.println("");
+            Serial.println(F("Scan a PICC to ADD or REMOVE to EEPROM"));
+            Serial.println(F("Scan Master Card again to Exit Program Mode"));
+            Serial.println(F("-----------------------------"));
+        }
+        else {
+            if (findID(readCard)) { // If not, see if the card is in the EEPROM
+                Serial.println(F("Welcome, You shall pass"));
+                lcd.clear();
+                lcd.print("Acces granted.");
+
+                granted(3000);         // Open the door lock for 300 ms
+                lcd.clear();
+            }
+            else {      // If not, show that the ID was not valid
+                lcd.clear();
+                lcd.print("Acces denied.");
+                Serial.println(F("You shall not pass"));
+                denied();
+            }
+        }
+    }
+}
+
+/////////////////////////////////////////  Access Granted    ///////////////////////////////////
+void granted(int setDelay) {
+    digitalWrite(yellowLed, LED_OFF);   // Turn off blue LED
+    digitalWrite(redLed, LED_OFF);  // Turn off red LED
+    digitalWrite(greenLed, LED_ON);   // Turn on green LED
+    digitalWrite(buzzer, HIGH);     // Unlock door!
+    delay(setDelay);          // Hold door lock open for given seconds
+    digitalWrite(buzzer, LOW);    // Relock door
+    delay(1000);            // Hold green LED on for a second
+}
+
+///////////////////////////////////////// Access Denied  ///////////////////////////////////
+void denied() {
+    digitalWrite(greenLed, LED_OFF);  // Make sure green LED is off
+    digitalWrite(yellowLed, LED_OFF);   // Make sure blue LED is off
+    digitalWrite(redLed, LED_ON);   // Turn on red LED
+    digitalWrite(buzzer, HIGH);
+    delay(200);
+    digitalWrite(buzzer, LOW);
+    delay(200);
+    digitalWrite(buzzer, HIGH);
+    delay(200);
+    digitalWrite(buzzer, LOW);
+    delay(200);
+    digitalWrite(buzzer, HIGH);
+    delay(200);
+    digitalWrite(buzzer, LOW);
+    delay(200);
+    delay(400);
+}
+
+
+///////////////////////////////////////// Get PICC's UID ///////////////////////////////////
+int getID() {
+    // Getting ready for Reading PICCs
+    if (!rfid.PICC_IsNewCardPresent()) { //If a new PICC placed to RFID reader continue
+        return 0;
+    }
+    if (!rfid.PICC_ReadCardSerial()) {   //Since a PICC placed get Serial and continue
+        return 0;
+    }
+    // There are Mifare PICCs which have 4 byte or 7 byte UID care if you use 7 byte PICC
+    // I think we should assume every PICC as they have 4 byte UID
+    // Until we support 7 byte PICCs
+    Serial.println(F("Scanned PICC's UID:"));
+    for (int i = 0; i < 4; i++) {  //
+        readCard[i] = rfid.uid.uidByte[i];
+        Serial.print(readCard[i], HEX);
+    }
+    Serial.println("");
+    rfid.PICC_HaltA(); // Stop reading
+    return 1;
+}
+
+void ShowReaderDetails() {
+    // Get the MFRC522 software version
+    byte v = rfid.PCD_ReadRegister(rfid.VersionReg);
+    Serial.print(F("MFRC522 Software Version: 0x"));
+    Serial.print(v, HEX);
+    if (v == 0x91)
+        Serial.print(F(" = v1.0"));
+    else if (v == 0x92)
+        Serial.print(F(" = v2.0"));
+    else
+        Serial.print(F(" (unknown),probably a chinese clone?"));
+    Serial.println("");
+    // When 0x00 or 0xFF is returned, communication probably failed
+    if ((v == 0x00) || (v == 0xFF)) {
+        Serial.println(F("WARNING: Communication failure, is the MFRC522 properly connected?"));
+        Serial.println(F("SYSTEM HALTED: Check connections."));
+        while (true); // do not go further
+    }
+}
+
+void cycleLeds() {
+    digitalWrite(redLed, LED_OFF);
+    digitalWrite(greenLed, LED_ON);
+    digitalWrite(yellowLed, LED_OFF);
+    delay(200);
+    digitalWrite(redLed, LED_OFF);
+    digitalWrite(greenLed, LED_OFF);
+    digitalWrite(yellowLed, LED_ON);
+    delay(200);
+    digitalWrite(redLed, LED_ON);
+    digitalWrite(greenLed, LED_OFF);
+    digitalWrite(yellowLed, LED_OFF);
+    delay(200);
+}
+
+
+void normalModeOn() {
+    digitalWrite(yellowLed, LED_ON);
+    digitalWrite(redLed, LED_OFF);
+    digitalWrite(greenLed, LED_OFF);
+    digitalWrite(buzzer, LOW);
+}
+
+void readID(int number) {
+    int start = (number * 4) + 2;                    // Figure out starting position
+    for (int i = 0; i < 4; i++)
+        storedCard[i] = EEPROM.read(start + i);      // Assign values read from EEPROM to array
+}
+
+void writeID(byte a[]) {
+    if (!findID(a)) {
+        int num = EEPROM.read(0);
+        int start = (num * 4) + 6;           // Figure out where the next slot starts
+        num++;
+        EEPROM.write(0, num);               // Write the new count to the counter
+        for (int j = 0; j < 4; j++)
+            EEPROM.write(start + j, a[j]);  // Write the array values to EEPROM in the right position
+        successWrite();
+        Serial.println(F("Succesfully added ID record to EEPROM"));
+    }
+    else {
+        failedWrite();
+        Serial.println(F("Failed! There is something wrong with ID or bad EEPROM"));
+    }
+}
+
+void deleteID(byte a[]) {
+    if (!findID(a)) {
+        failedWrite();
+        Serial.println(F("Failed! There is something wrong with ID or bad EEPROM"));
+    }
+    else {
+        int num = EEPROM.read(0);   // Get the numer of used spaces, position 0 stores the number of ID cards
+        int slot;                   // Figure out the slot number of the card
+        int start;                  // = ( num * 4 ) + 6; // Figure out where the next slot starts
+        int looping;                // The number of times the loop repeats
+        int j;
+        int count = EEPROM.read(0);// Read the first Byte of EEPROM that stores number of cards
+        slot = findIDSLOT(a);      // Figure out the slot number of the card to delete
+        start = (slot * 4) + 2;
+        looping = ((num - slot) * 4);
+        num--;
+        EEPROM.write(0, num);      // Write the new count to the counter
+        for (j = 0; j < looping; j++)
+            EEPROM.write(start + j, EEPROM.read(start + 4 + j));  // Shift the array values to 4 places earlier in the EEPROM
+
+        for (int k = 0; k < 4; k++) {         // Shifting loop
+            EEPROM.write(start + j + k, 0);
+        }
+        successDelete();
+        Serial.println(F("Succesfully removed ID record from EEPROM"));
+    }
+}
+
+boolean checkTwo(byte a[], byte b[]) {
+    if (a[0] != NULL)       // Make sure there is something in the array first
+        isMatch = true;       // Assume they match at first
+    for (int k = 0; k < 4; k++) {   // Loop 4 times
+        if (a[k] != b[k])     // IF a != b then set match = false, one fails, all fail
+            isMatch = false;
+    }
+    if (isMatch) {      // Check to see if if match is still true
+        return true;      // Return true
+    }
+    else {
+        return false;       // Return false
+    }
+}
+
+int findIDSLOT(byte find[]) {
+    int count = EEPROM.read(0);       // Read the first Byte of EEPROM that
+    for (int i = 1; i <= count; i++) {    // Loop once for each EEPROM entry
+        readID(i);                // Read an ID from EEPROM, it is stored in storedCard[4]
+        if (checkTwo(find, storedCard)) {   // Check to see if the storedCard read from EEPROM
+            return i;         // The slot number of the card
+            break;          // Stop looking we found it
+        }
+    }
+}
+
+boolean findID(byte find[]) {
+    for (int i = 1; i < EEPROM.read(0) + 1; i++) {    // Loop once for each EEPROM entry
+        readID(i);
+        if (checkTwo(find, storedCard)) {   // Check to see if the storedCard read from EEPROM
+            return true;
+            break;
+        }
+    }
+    return false;
+}
+
+void successWrite() {
+    digitalWrite(yellowLed, LED_OFF);
+    digitalWrite(redLed, LED_OFF);
+    digitalWrite(greenLed, LED_OFF);
+    for (int i = 0; i < 3; i++) {
+        digitalWrite(greenLed, LED_ON);
+        delay(200);
+        digitalWrite(greenLed, LED_OFF);
+        delay(200);
+    }
+}
+
+void failedWrite() {
+    digitalWrite(yellowLed, LED_OFF);
+    digitalWrite(redLed, LED_OFF);
+    digitalWrite(greenLed, LED_OFF);
+    for (int i = 0; i < 3; i++) {
+        digitalWrite(redLed, LED_ON);
+        delay(200);
+        digitalWrite(redLed, LED_OFF);
+        delay(200);
+    }
+}
+
+void successDelete() {
+    digitalWrite(yellowLed, LED_OFF);
+    digitalWrite(redLed, LED_OFF);
+    digitalWrite(greenLed, LED_OFF);
+    for (int i = 0; i < 3; i++) {
+        digitalWrite(yellowLed, LED_ON);
+        delay(200);
+        digitalWrite(yellowLed, LED_OFF);
+        delay(200);
+    }
+}
+
+boolean isMaster(byte test[]) {
+    if (checkTwo(test, masterCard))
+        return true;
+    else
+        return false;
+}
